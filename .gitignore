@@ -1,0 +1,44 @@
+# 二进制文件
+wp_crawl
+
+# 构建输出
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 测试输出
+*.test
+*.out
+
+# 依赖目录
+vendor/
+
+# IDE 配置
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 扫描结果文件
+hits_*.ndjson.gz
+hits_*.ndjson
+urls_*.txt
+unique_urls_*.txt
+domains_*.txt
+scanner_state_*.json
+
+# 日志文件
+*.log
+scan.log
+scan.pid
+
+# 临时文件
+*.tmp
+temp/
+tmp/

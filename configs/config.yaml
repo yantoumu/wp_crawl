@@ -1,0 +1,58 @@
+# WordPress REST API Scanner Configuration
+
+# Crawl settings
+crawl:
+  name: "CC-MAIN-2025-38"  # Common Crawl batch ID
+  segments: []              # Empty means process all segments
+  start_from: 0            # Start from WAT file index
+
+# Concurrency settings
+concurrency:
+  workers: 10              # Number of concurrent workers
+  download_queue: 50       # Download queue size
+  process_queue: 100       # Process queue size
+
+# Network settings
+network:
+  timeout: 30s             # HTTP request timeout
+  retry_attempts: 3        # Number of retry attempts
+  retry_delay: 2s         # Delay between retries
+  user_agent: "WP-Scanner/1.0 (WordPress API Discovery)"
+
+# Detection settings
+detection:
+  patterns:               # Patterns to detect WordPress API
+    - "api.w.org"
+    - "wp/v2"
+    - "wp-json"
+  enable_cdx: false       # Enable CDX validation
+  cdx_timeout: 10s       # CDX query timeout
+  pre_filter: true       # Enable pre-filtering optimization
+
+# Output settings
+output:
+  directory: "."          # Output directory
+  file_prefix: "hits"     # Output file prefix
+  compress: true          # Enable gzip compression
+  buffer_size: 1048576    # Write buffer size (1MB)
+  flush_interval: 10s     # Buffer flush interval
+
+# Resume settings
+resume:
+  enable: true            # Enable resume from previous state
+  state_file: "scanner_state.json"
+  save_interval: 30s      # State save interval
+
+# Monitor settings
+monitor:
+  enable: true           # Enable monitoring
+  metrics_port: 8080     # Metrics HTTP port
+  log_level: "info"      # Log level (debug, info, warn, error)
+  log_file: "scanner.log"
+  progress_bar: true     # Show progress bar
+
+# Performance settings
+performance:
+  max_memory_mb: 2048    # Maximum memory usage in MB
+  enable_profile: false  # Enable pprof profiling
+  profile_port: 6060     # Profiling HTTP port
