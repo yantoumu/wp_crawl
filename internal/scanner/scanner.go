@@ -2,6 +2,7 @@
 package scanner
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -216,8 +217,15 @@ func (s *Scanner) getWATList() ([]string, error) {
 	}
 	defer resp.Body.Close()
 
+	// 创建 gzip 解压读取器
+	gzReader, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("create gzip reader: %w", err)
+	}
+	defer gzReader.Close()
+
 	// 读取并解析路径
-	content, err := io.ReadAll(resp.Body)
+	content, err := io.ReadAll(gzReader)
 	if err != nil {
 		return nil, fmt.Errorf("read paths: %w", err)
 	}

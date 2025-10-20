@@ -14,7 +14,7 @@ concurrency:
 
 # Network settings
 network:
-  timeout: 30s             # HTTP request timeout
+  timeout: 600s            # HTTP request timeout (10 minutes for large WAT files)
   retry_attempts: 3        # Number of retry attempts
   retry_delay: 2s         # Delay between retries
   user_agent: "WP-Scanner/1.0 (WordPress API Discovery)"
