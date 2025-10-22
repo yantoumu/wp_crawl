@@ -38,6 +38,10 @@ scanner_state.json
 bin/
 domains/
 
+# 备份文件
+*.backup
+*.old
+
 # 日志文件
 *.log
 scan.log

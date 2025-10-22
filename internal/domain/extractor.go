@@ -2,10 +2,31 @@
 package domain
 
 import (
+	"net"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 )
+
+// 黑名单关键词（赌博、VIP等）
+var blacklistKeywords = []string{
+	// VIP相关
+	"vip",
+	// 赌博类
+	"casino", "casinos", "bet", "betting", "bets",
+	"gamble", "gambling", "gambler",
+	"poker", "lottery", "lotto",
+	"slot", "slots", "jackpot",
+	"bingo", "roulette", "blackjack",
+	"dice", "wager", "wagering",
+	"sportsbook", "bookmaker",
+	// 常见变体
+	"casin0", "g4mble", "b3t",
+}
+
+// IPv4地址正则表达式
+var ipv4Regex = regexp.MustCompile(`^(\d{1,3}\.){3}\d{1,3}$`)
 
 // Extractor 域名提取器
 type Extractor struct {
@@ -18,6 +39,70 @@ func NewExtractor() *Extractor {
 	return &Extractor{
 		domains: make(map[string]string),
 	}
+}
+
+// isIPAddress 检测是否为IP地址
+func isIPAddress(host string) bool {
+	// 移除端口号
+	if idx := strings.Index(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+
+	// 检测IPv6 (带方括号的格式已被移除)
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+
+	// 使用 net.ParseIP 检测
+	if net.ParseIP(host) != nil {
+		return true
+	}
+
+	// 额外使用正则检测IPv4
+	return ipv4Regex.MatchString(host)
+}
+
+// containsBlacklistedKeywords 检测是否包含黑名单关键词
+func containsBlacklistedKeywords(domain string) bool {
+	domainLower := strings.ToLower(domain)
+
+	for _, keyword := range blacklistKeywords {
+		if strings.Contains(domainLower, keyword) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isValidDomain 验证域名是否有效（非IP、非黑名单）
+func isValidDomain(domain string) bool {
+	if domain == "" {
+		return false
+	}
+
+	// 解析URL获取host
+	parsedURL, err := url.Parse(domain)
+	if err != nil {
+		return false
+	}
+
+	host := parsedURL.Host
+	if host == "" {
+		return false
+	}
+
+	// 检查是否为IP地址
+	if isIPAddress(host) {
+		return false
+	}
+
+	// 检查是否包含黑名单关键词
+	if containsBlacklistedKeywords(domain) {
+		return false
+	}
+
+	return true
 }
 
 // ExtractDomain 从 URL 中提取主域名
@@ -73,6 +158,11 @@ func (e *Extractor) AddFromURLWithLanguage(rawURL, language string) error {
 	domain, err := ExtractDomain(rawURL)
 	if err != nil {
 		return err
+	}
+
+	// 验证域名（过滤IP地址和黑名单关键词）
+	if !isValidDomain(domain) {
+		return nil // 跳过无效域名，不报错
 	}
 
 	e.AddWithLanguage(domain, language)
