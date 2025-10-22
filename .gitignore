@@ -32,6 +32,11 @@ urls_*.txt
 unique_urls_*.txt
 domains_*.txt
 scanner_state_*.json
+scanner_state.json
+
+# 输出目录
+bin/
+domains/
 
 # 日志文件
 *.log

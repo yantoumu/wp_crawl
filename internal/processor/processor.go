@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -29,20 +30,19 @@ type WATProcessor struct {
 
 	// 统计信息
 	stats     *ProcessorStats
-	statsMu   sync.RWMutex
 }
 
 // ProcessorStats 处理器统计信息
 type ProcessorStats struct {
-	TotalFiles      int64
-	ProcessedFiles  int64
-	TotalRecords    int64
-	ProcessedRecords int64
-	TotalHits       int64
-	TotalErrors     int64
-	BytesProcessed  int64
-	StartTime       time.Time
-	LastUpdateTime  time.Time
+	TotalFiles       atomic.Int64
+	ProcessedFiles   atomic.Int64
+	TotalRecords     atomic.Int64
+	ProcessedRecords atomic.Int64
+	TotalHits        atomic.Int64
+	TotalErrors      atomic.Int64
+	BytesProcessed   atomic.Int64
+	StartTime        time.Time
+	lastUpdateTime   atomic.Value // 存储 time.Time，减少锁竞争
 }
 
 // NewWATProcessor 创建新的WAT处理器
@@ -55,14 +55,17 @@ func NewWATProcessor(cfg *config.Config, det *detector.Detector, logger *zap.Log
 	retryClient.HTTPClient.Timeout = cfg.Network.Timeout
 	retryClient.Logger = nil // 使用自定义logger
 
+	stats := &ProcessorStats{
+		StartTime: time.Now(),
+	}
+	stats.lastUpdateTime.Store(time.Now())
+
 	return &WATProcessor{
 		config:   cfg,
 		detector: det,
 		client:   retryClient,
 		logger:   logger,
-		stats: &ProcessorStats{
-			StartTime: time.Now(),
-		},
+		stats:    stats,
 	}
 }
 
@@ -91,6 +94,8 @@ func (p *WATProcessor) ProcessWATFile(ctx context.Context, watURL string) (<-cha
 
 // streamProcessWAT 流式处理WAT文件
 func (p *WATProcessor) streamProcessWAT(ctx context.Context, watURL string, hitChan chan<- *detector.Hit) error {
+	p.logger.Debug("Starting download", zap.String("url", watURL))
+
 	// 创建HTTP请求
 	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", watURL, nil)
 	if err != nil {
@@ -99,6 +104,7 @@ func (p *WATProcessor) streamProcessWAT(ctx context.Context, watURL string, hitC
 	req.Header.Set("User-Agent", p.config.Network.UserAgent)
 
 	// 发送请求
+	downloadStart := time.Now()
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("download WAT: %w", err)
@@ -109,10 +115,20 @@ func (p *WATProcessor) streamProcessWAT(ctx context.Context, watURL string, hitC
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
+	downloadDuration := time.Since(downloadStart)
+	p.logger.Debug("Download started",
+		zap.Duration("connection_time", downloadDuration),
+		zap.Int64("content_length", resp.ContentLength))
+
 	// 根据内容类型选择读取器
-	reader, err := p.createReader(resp.Body, watURL)
-	if err != nil {
-		return fmt.Errorf("create reader: %w", err)
+	var reader io.Reader = resp.Body
+	if strings.HasSuffix(watURL, ".gz") {
+		gzReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return fmt.Errorf("create gzip reader: %w", err)
+		}
+		defer gzReader.Close()  // 确保关闭 gzip reader
+		reader = gzReader
 	}
 
 	// 使用WARC库解析
@@ -134,11 +150,12 @@ func (p *WATProcessor) streamProcessWAT(ctx context.Context, watURL string, hitC
 			break
 		}
 		if err != nil {
-			p.logger.Warn("Failed to read WARC record",
+			// 网络错误时记录一次Debug后退出，避免疯狂写日志
+			p.logger.Debug("Failed to read WARC record",
 				zap.String("url", watURL),
 				zap.Error(err))
 			p.incrementErrorCount()
-			continue
+			break // 改为 break，遇到错误直接退出循环
 		}
 
 		// 更新记录统计
@@ -152,7 +169,7 @@ func (p *WATProcessor) streamProcessWAT(ctx context.Context, watURL string, hitC
 		// 读取记录内容
 		content, err := io.ReadAll(record.Content)
 		if err != nil {
-			p.logger.Warn("Failed to read record content",
+			p.logger.Debug("Failed to read record content",
 				zap.Error(err))
 			p.incrementErrorCount()
 			continue
@@ -185,15 +202,6 @@ func (p *WATProcessor) streamProcessWAT(ctx context.Context, watURL string, hitC
 	}
 
 	return nil
-}
-
-// createReader 根据文件类型创建适当的读取器
-func (p *WATProcessor) createReader(body io.Reader, url string) (io.Reader, error) {
-	// 检查是否是gzip文件
-	if strings.HasSuffix(url, ".gz") {
-		return gzip.NewReader(body)
-	}
-	return body, nil
 }
 
 // ProcessWATList 处理WAT文件列表
@@ -235,6 +243,13 @@ func (p *WATProcessor) ProcessWATList(ctx context.Context, watURLs []string) (<-
 	return hitChan, nil
 }
 
+// WATFileResult 单个WAT文件的处理结果
+type WATFileResult struct {
+	URL      string
+	Hits     []*detector.Hit
+	Duration time.Duration
+}
+
 // worker 工作者函数
 func (p *WATProcessor) worker(ctx context.Context, id int, workChan <-chan string, hitChan chan<- *detector.Hit) {
 	p.logger.Info("Worker started", zap.Int("worker_id", id))
@@ -247,11 +262,12 @@ func (p *WATProcessor) worker(ctx context.Context, id int, workChan <-chan strin
 		default:
 		}
 
-		p.logger.Debug("Processing WAT file",
-			zap.Int("worker_id", id),
-			zap.String("url", watURL))
+		// p.logger.Info("Downloading WAT file",
+		// 	zap.Int("worker_id", id),
+		// 	zap.String("url", watURL))
 
 		// 处理单个WAT文件
+		// startTime := time.Now()
 		hits, err := p.ProcessWATFile(ctx, watURL)
 		if err != nil {
 			p.logger.Error("Failed to process WAT file",
@@ -262,73 +278,100 @@ func (p *WATProcessor) worker(ctx context.Context, id int, workChan <-chan strin
 		}
 
 		// 收集结果
+		hitCount := 0
 		for hit := range hits {
 			select {
 			case hitChan <- hit:
+				hitCount++
 			case <-ctx.Done():
 				return
 			}
 		}
+
+		// duration := time.Since(startTime)
+
+		// Get detector stats for debugging
+		// stats := p.detector.GetStats()
+
+		// p.logger.Info("WAT file processed",
+		// 	zap.Int("worker_id", id),
+		// 	zap.Duration("duration", duration),
+		// 	zap.Int("hits", hitCount),
+		// 	zap.Int64("total_records", stats["total_records"]),
+		// 	zap.Int64("quick_check_pass", stats["quick_check_pass"]),
+		// 	zap.Int64("has_payload", stats["has_payload"]))
 	}
 
 	p.logger.Info("Worker finished", zap.Int("worker_id", id))
 }
 
-// GetStats 获取统计信息
-func (p *WATProcessor) GetStats() ProcessorStats {
-	p.statsMu.RLock()
-	defer p.statsMu.RUnlock()
-	return *p.stats
+// GetStatsSnapshot 获取统计信息快照（返回普通值）
+type StatsSnapshot struct {
+	TotalFiles       int64
+	ProcessedFiles   int64
+	TotalRecords     int64
+	ProcessedRecords int64
+	TotalHits        int64
+	TotalErrors      int64
+	BytesProcessed   int64
+	StartTime        time.Time
+	LastUpdateTime   time.Time
 }
 
-// 统计方法
+func (p *WATProcessor) GetStatsSnapshot() StatsSnapshot {
+	lastUpdate := p.stats.lastUpdateTime.Load()
+	var lastUpdateTime time.Time
+	if lastUpdate != nil {
+		lastUpdateTime = lastUpdate.(time.Time)
+	}
+
+	return StatsSnapshot{
+		TotalFiles:       p.stats.TotalFiles.Load(),
+		ProcessedFiles:   p.stats.ProcessedFiles.Load(),
+		TotalRecords:     p.stats.TotalRecords.Load(),
+		ProcessedRecords: p.stats.ProcessedRecords.Load(),
+		TotalHits:        p.stats.TotalHits.Load(),
+		TotalErrors:      p.stats.TotalErrors.Load(),
+		BytesProcessed:   p.stats.BytesProcessed.Load(),
+		StartTime:        p.stats.StartTime,
+		LastUpdateTime:   lastUpdateTime,
+	}
+}
+
+// 统计方法 - 使用 atomic 无锁操作（性能优化）
 func (p *WATProcessor) incrementFileCount() {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	p.stats.TotalFiles++
-	p.stats.LastUpdateTime = time.Now()
+	p.stats.TotalFiles.Add(1)
 }
 
 func (p *WATProcessor) incrementProcessedFileCount() {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	p.stats.ProcessedFiles++
-	p.stats.LastUpdateTime = time.Now()
+	p.stats.ProcessedFiles.Add(1)
+	p.updateTimestamp()
 }
 
 func (p *WATProcessor) incrementRecordCount() {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	p.stats.TotalRecords++
-	p.stats.LastUpdateTime = time.Now()
+	p.stats.TotalRecords.Add(1)
 }
 
 func (p *WATProcessor) incrementProcessedRecordCount() {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	p.stats.ProcessedRecords++
-	p.stats.LastUpdateTime = time.Now()
+	p.stats.ProcessedRecords.Add(1)
 }
 
 func (p *WATProcessor) incrementHitCount() {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	p.stats.TotalHits++
-	p.stats.LastUpdateTime = time.Now()
+	p.stats.TotalHits.Add(1)
 }
 
 func (p *WATProcessor) incrementErrorCount() {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	p.stats.TotalErrors++
-	p.stats.LastUpdateTime = time.Now()
+	p.stats.TotalErrors.Add(1)
 }
 
 func (p *WATProcessor) addBytesProcessed(bytes int64) {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	p.stats.BytesProcessed += bytes
-	p.stats.LastUpdateTime = time.Now()
+	p.stats.BytesProcessed.Add(bytes)
+}
+
+// updateTimestamp 批量更新时间戳（降低频率）
+func (p *WATProcessor) updateTimestamp() {
+	// 只在处理完整个文件时更新一次，而不是每条记录都更新
+	p.stats.lastUpdateTime.Store(time.Now())
 }
 
 // StreamProcessor 提供更高级的流处理接口

@@ -8,13 +8,13 @@ crawl:
 
 # Concurrency settings
 concurrency:
-  workers: 10              # Number of concurrent workers
+  workers: 6               # Number of concurrent workers (10会导致网络错误，降低到6)
   download_queue: 50       # Download queue size
   process_queue: 100       # Process queue size
 
 # Network settings
 network:
-  timeout: 600s            # HTTP request timeout (10 minutes for large WAT files)
+  timeout: 1200s           # HTTP request timeout (20 minutes for large WAT files)
   retry_attempts: 3        # Number of retry attempts
   retry_delay: 2s         # Delay between retries
   user_agent: "WP-Scanner/1.0 (WordPress API Discovery)"
@@ -43,11 +43,9 @@ resume:
   state_file: "scanner_state.json"
   save_interval: 30s      # State save interval
 
-# Monitor settings
-monitor:
-  enable: true           # Enable monitoring
-  metrics_port: 8080     # Metrics HTTP port
-  log_level: "info"      # Log level (debug, info, warn, error)
+# Logging settings
+logging:
+  log_level: "warn"      # Log level (debug, info, warn, error) - 只记录警告和错误
   log_file: "scanner.log"
   progress_bar: true     # Show progress bar
 

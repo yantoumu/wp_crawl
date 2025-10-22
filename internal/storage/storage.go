@@ -50,9 +50,10 @@ type NDJSONStorage struct {
 	stats      *StorageStats
 	statsMu    sync.RWMutex
 
-	mu         sync.Mutex
-	flushTimer *time.Timer
-	closed     bool
+	mu          sync.Mutex
+	flushTicker *time.Ticker  // 使用 Ticker 替代 Timer
+	flushDone   chan struct{} // 停止信号
+	closed      bool
 }
 
 // NewNDJSONStorage 创建NDJSON存储
@@ -181,23 +182,25 @@ func (s *NDJSONStorage) flushLocked() error {
 // Close 关闭存储
 func (s *NDJSONStorage) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
-
 	s.closed = true
+	s.mu.Unlock()
 
 	// 停止刷新定时器
-	if s.flushTimer != nil {
-		s.flushTimer.Stop()
+	if s.flushTicker != nil {
+		s.flushTicker.Stop()
+		close(s.flushDone)
 	}
 
 	// 刷新剩余数据
+	s.mu.Lock()
 	if err := s.flushLocked(); err != nil {
 		s.logger.Error("Failed to flush on close", zap.Error(err))
 	}
+	s.mu.Unlock()
 
 	// 关闭gzip写入器
 	if gzWriter, ok := s.writer.(*gzip.Writer); ok {
@@ -232,12 +235,21 @@ func (s *NDJSONStorage) startFlushTimer() {
 		return
 	}
 
-	s.flushTimer = time.AfterFunc(s.config.Output.FlushInterval, func() {
-		if err := s.Flush(); err != nil {
-			s.logger.Error("Auto flush failed", zap.Error(err))
+	s.flushTicker = time.NewTicker(s.config.Output.FlushInterval)
+	s.flushDone = make(chan struct{})
+
+	go func() {
+		for {
+			select {
+			case <-s.flushTicker.C:
+				if err := s.Flush(); err != nil {
+					s.logger.Error("Auto flush failed", zap.Error(err))
+				}
+			case <-s.flushDone:
+				return
+			}
 		}
-		s.startFlushTimer() // 重新启动定时器
-	})
+	}()
 }
 
 // updateWriteStats 更新写入统计
@@ -371,28 +383,68 @@ func (a *AsyncWriter) writeLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	// 失败计数器：防止日志炸弹
+	var writeFailures int64
+	var flushFailures int64
+	const maxFailures = 10
+	lastErrorTime := time.Now()
+
 	for {
 		select {
-		case hit := <-a.writeChan:
+		case hit, ok := <-a.writeChan:
+			if !ok {
+				// channel 已关闭，刷新并退出
+				if err := batch.Flush(); err != nil {
+					a.logger.Error("Failed to final flush", zap.Error(err))
+				}
+				return
+			}
 			if err := batch.Add(hit); err != nil {
-				a.logger.Error("Failed to write hit", zap.Error(err))
+				writeFailures++
+				now := time.Now()
+
+				// 前N次失败记录，之后限流：每秒最多1条
+				if writeFailures <= maxFailures || now.Sub(lastErrorTime) > time.Second {
+					a.logger.Error("Failed to write hit",
+						zap.Error(err),
+						zap.Int64("failure_count", writeFailures))
+					lastErrorTime = now
+				}
+
+				// 达到临界值时暂停等待
+				if writeFailures > 1000 {
+					a.logger.Warn("Critical: write failure threshold exceeded, pausing for 30s",
+						zap.Int64("failures", writeFailures))
+					time.Sleep(30 * time.Second)
+					// 重置计数器，继续尝试
+					writeFailures = 0
+				}
+			} else {
+				writeFailures = 0 // 成功后重置
 			}
 
 		case <-ticker.C:
 			if err := batch.Flush(); err != nil {
-				a.logger.Error("Failed to flush batch", zap.Error(err))
+				flushFailures++
+				if flushFailures <= maxFailures {
+					a.logger.Error("Failed to flush batch",
+						zap.Error(err),
+						zap.Int64("flush_failures", flushFailures))
+				}
+
+				if flushFailures > 100 {
+					a.logger.Warn("Critical: persistent flush failures, pausing for 30s",
+						zap.Int64("failures", flushFailures))
+					time.Sleep(30 * time.Second)
+					// 重置计数器，继续尝试
+					flushFailures = 0
+				}
+			} else {
+				flushFailures = 0 // 成功后重置
 			}
 
 		case <-a.ctx.Done():
-			// 处理剩余数据
-			for hit := range a.writeChan {
-				if err := batch.Add(hit); err != nil {
-					a.logger.Error("Failed to write remaining hit", zap.Error(err))
-				}
-			}
-			if err := batch.Flush(); err != nil {
-				a.logger.Error("Failed to final flush", zap.Error(err))
-			}
+			// context 取消，直接退出（channel 应该已经关闭）
 			return
 		}
 	}
@@ -400,8 +452,8 @@ func (a *AsyncWriter) writeLoop() {
 
 // Close 关闭异步写入器
 func (a *AsyncWriter) Close() error {
-	a.cancel()
-	close(a.writeChan)
+	close(a.writeChan)  // 先关闭 channel，触发 range 退出
+	a.cancel()          // 再取消 context（保险措施）
 	a.wg.Wait()
 	return a.storage.Close()
 }

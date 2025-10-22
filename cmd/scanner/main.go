@@ -142,7 +142,7 @@ func loadConfig(cmd *cobra.Command) error {
 		}
 
 		if noProgress, _ := cmd.Flags().GetBool("no-progress"); noProgress {
-			cfg.Monitor.ProgressBar = false
+			cfg.Logging.ProgressBar = false
 		}
 	}
 
@@ -151,8 +151,17 @@ func loadConfig(cmd *cobra.Command) error {
 
 // initLogger 初始化日志器
 func initLogger() error {
-	logLevel, _ := rootCmd.PersistentFlags().GetString("log-level")
-	logFile, _ := rootCmd.PersistentFlags().GetString("log-file")
+	// 优先使用配置文件中的日志级别
+	logLevel := cfg.Logging.LogLevel
+	logFile := cfg.Logging.LogFile
+
+	// 如果命令行显式设置了日志级别，则覆盖配置文件
+	if rootCmd.PersistentFlags().Changed("log-level") {
+		logLevel, _ = rootCmd.PersistentFlags().GetString("log-level")
+	}
+	if rootCmd.PersistentFlags().Changed("log-file") {
+		logFile, _ = rootCmd.PersistentFlags().GetString("log-file")
+	}
 
 	var err error
 	logger, err = monitor.NewLogger(logLevel, logFile)
@@ -186,15 +195,8 @@ func runScan(cmd *cobra.Command, args []string) error {
 		zap.String("crawl", cfg.Crawl.Name),
 		zap.Int("workers", cfg.Concurrency.Workers))
 
-	// 创建监控器
-	var metricsCollector *monitor.MetricsCollector
-	if cfg.Monitor.Enable {
-		metricsCollector = monitor.NewMetricsCollector(cfg.Monitor.MetricsPort, logger)
-		if err := metricsCollector.Start(); err != nil {
-			logger.Warn("Failed to start metrics server", zap.Error(err))
-		}
-		defer metricsCollector.Stop()
-	}
+	// 监控器已移除，使用日志系统
+	// 如果需要metrics，可以后续添加
 
 	// 创建扫描器
 	scan, err := scanner.NewScanner(cfg, logger)

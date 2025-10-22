@@ -53,14 +53,12 @@ type Config struct {
 		SaveInterval  time.Duration `mapstructure:"save_interval"` // 保存间隔
 	} `mapstructure:"resume"`
 
-	// 监控设置
-	Monitor struct {
-		Enable        bool   `mapstructure:"enable"`         // 是否启用监控
-		MetricsPort   int    `mapstructure:"metrics_port"`   // 指标端口
+	// 日志设置
+	Logging struct {
 		LogLevel      string `mapstructure:"log_level"`      // 日志级别
 		LogFile       string `mapstructure:"log_file"`       // 日志文件
 		ProgressBar   bool   `mapstructure:"progress_bar"`   // 是否显示进度条
-	} `mapstructure:"monitor"`
+	} `mapstructure:"logging"`
 
 	// 性能优化
 	Performance struct {
@@ -87,7 +85,7 @@ func DefaultConfig() *Config {
 			DownloadQueue int `mapstructure:"download_queue"`
 			ProcessQueue  int `mapstructure:"process_queue"`
 		}{
-			Workers:       10,
+			Workers:       1,  // 默认串行下载
 			DownloadQueue: 50,
 			ProcessQueue:  100,
 		},
@@ -135,15 +133,11 @@ func DefaultConfig() *Config {
 			StateFile:     "scanner_state.json",
 			SaveInterval:  30 * time.Second,
 		},
-		Monitor: struct {
-			Enable        bool   `mapstructure:"enable"`
-			MetricsPort   int    `mapstructure:"metrics_port"`
+		Logging: struct {
 			LogLevel      string `mapstructure:"log_level"`
 			LogFile       string `mapstructure:"log_file"`
 			ProgressBar   bool   `mapstructure:"progress_bar"`
 		}{
-			Enable:        true,
-			MetricsPort:   8080,
 			LogLevel:      "info",
 			LogFile:       "scanner.log",
 			ProgressBar:   true,

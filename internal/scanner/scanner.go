@@ -20,17 +20,19 @@ import (
 
 	"github.com/yanyun/wp_crawl/internal/config"
 	"github.com/yanyun/wp_crawl/internal/detector"
+	"github.com/yanyun/wp_crawl/internal/domain"
 	"github.com/yanyun/wp_crawl/internal/processor"
 	"github.com/yanyun/wp_crawl/internal/storage"
 )
 
 // Scanner 主扫描器
 type Scanner struct {
-	config    *config.Config
-	detector  *detector.Detector
-	processor *processor.WATProcessor
-	storage   storage.Storage
-	logger    *zap.Logger
+	config        *config.Config
+	detector      *detector.Detector
+	processor     *processor.WATProcessor
+	storage       storage.Storage
+	domainStorage *domain.Storage  // 域名存储
+	logger        *zap.Logger
 
 	// 状态管理
 	state     *ScannerState
@@ -42,6 +44,11 @@ type Scanner struct {
 	// 控制
 	ctx       context.Context
 	cancel    context.CancelFunc
+
+	// 域名提取器（按 WAT 文件）
+	currentExtractor *domain.Extractor
+	currentWATURL    string
+	extractorMu      sync.Mutex
 }
 
 // ScannerState 扫描器状态
@@ -71,16 +78,23 @@ func NewScanner(cfg *config.Config, logger *zap.Logger) (*Scanner, error) {
 		return nil, fmt.Errorf("create storage: %w", err)
 	}
 
+	// 创建域名存储（输出目录为 domains）
+	domainStor, err := domain.NewStorage("domains", logger)
+	if err != nil {
+		return nil, fmt.Errorf("create domain storage: %w", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	scanner := &Scanner{
-		config:    cfg,
-		detector:  det,
-		processor: proc,
-		storage:   stor,
-		logger:    logger,
-		ctx:       ctx,
-		cancel:    cancel,
+		config:        cfg,
+		detector:      det,
+		processor:     proc,
+		storage:       stor,
+		domainStorage: domainStor,
+		logger:        logger,
+		ctx:           ctx,
+		cancel:        cancel,
 		state: &ScannerState{
 			CrawlID:   cfg.Crawl.Name,
 			StartTime: time.Now(),
@@ -118,7 +132,7 @@ func (s *Scanner) Start() error {
 	})
 
 	// 创建进度条
-	if s.config.Monitor.ProgressBar {
+	if s.config.Logging.ProgressBar {
 		s.progress = progressbar.NewOptions(len(watURLs),
 			progressbar.OptionEnableColorCodes(true),
 			progressbar.OptionShowBytes(false),
@@ -147,21 +161,100 @@ func (s *Scanner) Start() error {
 		go s.periodicStateSave()
 	}
 
-	// 处理结果
+	// 启动定期保存主域名文件协程（每5分钟保存一次）
+	go s.periodicMasterSave(5 * time.Minute)
+
+	// 处理结果并提取域名
 	var totalHits int64
+	currentExtractor := domain.NewExtractor()
+	var currentWATURL string
+
+	// 失败计数器：防止日志炸弹
+	var writeFailures int64
+	const maxWriteFailures = 10
+
 	for hit := range hitChan {
+		// 写入 hit 到存储
 		if err := asyncWriter.Write(hit); err != nil {
-			s.logger.Error("Failed to write hit", zap.Error(err))
+			atomic.AddInt64(&writeFailures, 1)
+			failures := atomic.LoadInt64(&writeFailures)
+
+			// 只记录前N次失败，防止疯狂写日志
+			if failures <= maxWriteFailures {
+				s.logger.Error("Failed to write hit",
+					zap.Error(err),
+					zap.Int64("failure_count", failures))
+			} else if failures == maxWriteFailures+1 {
+				s.logger.Error("Too many write failures, suppressing further logs",
+					zap.Int64("total_failures", failures))
+			}
+
+			// 达到临界值时暂停等待，防止磁盘填满
+			if failures > 1000 {
+				s.logger.Warn("Critical: write failure threshold exceeded, pausing for 30s",
+					zap.Int64("failures", failures))
+				time.Sleep(30 * time.Second)
+				// 重置计数器，继续尝试
+				atomic.StoreInt64(&writeFailures, 0)
+			}
 			continue
 		}
+		// 写入成功，重置失败计数
+		atomic.StoreInt64(&writeFailures, 0)
 
 		atomic.AddInt64(&totalHits, 1)
 
-		// 更新进度
-		if s.progress != nil && atomic.LoadInt64(&totalHits)%100 == 0 {
+		// 检测 WAT 文件是否切换（处理完一个文件）
+		if currentWATURL != "" && hit.WATLocation != currentWATURL {
+			// 保存上一个 WAT 文件的域名-语言对
+			domainLangPairs := currentExtractor.GetDomainLanguagePairs()
+			if len(domainLangPairs) > 0 {
+				if err := s.domainStorage.SaveBatch(currentWATURL, domainLangPairs); err != nil {
+					s.logger.Error("Failed to save domains for WAT file",
+						zap.String("wat_url", currentWATURL),
+						zap.Error(err))
+				}
+			}
+
+			// 重置提取器
+			currentExtractor = domain.NewExtractor()
+		}
+
+		// 更新当前 WAT URL
+		currentWATURL = hit.WATLocation
+
+		// 提取域名和语言（所有 hit 都有评论表单，直接提取）
+		if err := currentExtractor.AddFromURLWithLanguage(hit.URL, hit.Language); err != nil {
+			s.logger.Debug("Failed to extract domain",
+				zap.String("url", hit.URL),
+				zap.Error(err))
+		}
+
+		// 更新进度（降低频率：100 → 1000，减少90%系统调用）
+		if s.progress != nil && atomic.LoadInt64(&totalHits)%1000 == 0 {
 			processedWATs := s.getProcessedWATCount()
 			s.progress.Set(processedWATs)
 		}
+	}
+
+	// 保存最后一个 WAT 文件的域名-语言对
+	if currentWATURL != "" {
+		domainLangPairs := currentExtractor.GetDomainLanguagePairs()
+		if len(domainLangPairs) > 0 {
+			if err := s.domainStorage.SaveBatch(currentWATURL, domainLangPairs); err != nil {
+				s.logger.Error("Failed to save domains for last WAT file",
+					zap.String("wat_url", currentWATURL),
+					zap.Error(err))
+			}
+		}
+	}
+
+	// 保存最终的主域名文件（所有批次合并去重）
+	if err := s.domainStorage.SaveMaster(); err != nil {
+		s.logger.Error("Failed to save master domains file", zap.Error(err))
+	} else {
+		s.logger.Info("All domains saved",
+			zap.Int("total_unique", s.domainStorage.GetGlobalCount()))
 	}
 
 	// 关闭写入器
@@ -197,6 +290,12 @@ func (s *Scanner) Stop() {
 		if err := s.saveState(); err != nil {
 			s.logger.Error("Failed to save state on stop", zap.Error(err))
 		}
+	}
+
+	// 域名存储统计（主文件已在 Start() 结束时保存）
+	if s.domainStorage != nil {
+		s.logger.Info("Domain extraction completed",
+			zap.Int("total_unique_domains", s.domainStorage.GetGlobalCount()))
 	}
 
 	// 关闭存储
@@ -273,14 +372,38 @@ func (s *Scanner) getWATList() ([]string, error) {
 
 // isSegmentCompleted 检查段是否已完成
 func (s *Scanner) isSegmentCompleted(path string) bool {
+	// 方法1: 检查状态文件中的记录
 	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-
 	for _, completed := range s.state.CompletedSegments {
 		if path == completed {
+			s.stateMu.RUnlock()
 			return true
 		}
 	}
+	s.stateMu.RUnlock()
+
+	// 方法2: 检查是否已存在对应的输出文件（更可靠）
+	// 从路径提取文件名：segments/xxx/wat/CC-MAIN-xxx.warc.wat.gz -> CC-MAIN-xxx.txt
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 {
+		return false
+	}
+
+	filename := parts[len(parts)-1]
+	// 移除 .warc.wat.gz 后缀
+	filename = strings.TrimSuffix(filename, ".warc.wat.gz")
+	filename = filename + ".txt"
+
+	// 检查 domains/raw/ 目录下是否存在该文件
+	outputFile := fmt.Sprintf("domains/raw/%s", filename)
+	if _, err := os.Stat(outputFile); err == nil {
+		// 文件存在，说明已处理
+		s.logger.Debug("Skipping already processed WAT file",
+			zap.String("path", path),
+			zap.String("output_file", outputFile))
+		return true
+	}
+
 	return false
 }
 
@@ -364,6 +487,28 @@ func (s *Scanner) periodicStateSave() {
 	}
 }
 
+// periodicMasterSave 定期保存主域名文件（去重汇总）
+func (s *Scanner) periodicMasterSave(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if s.domainStorage != nil {
+				if err := s.domainStorage.SaveMaster(); err != nil {
+					s.logger.Error("Failed to save master domains file periodically", zap.Error(err))
+				} else {
+					s.logger.Info("Master domains file saved periodically",
+						zap.Int("total_unique_domains", s.domainStorage.GetGlobalCount()))
+				}
+			}
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
 // updateState 更新状态
 func (s *Scanner) updateState(fn func(*ScannerState)) {
 	s.stateMu.Lock()
@@ -374,13 +519,13 @@ func (s *Scanner) updateState(fn func(*ScannerState)) {
 
 // getProcessedWATCount 获取已处理的WAT文件数
 func (s *Scanner) getProcessedWATCount() int {
-	stats := s.processor.GetStats()
+	stats := s.processor.GetStatsSnapshot()
 	return int(stats.ProcessedFiles)
 }
 
 // printStats 打印统计信息
 func (s *Scanner) printStats(totalHits int64) {
-	procStats := s.processor.GetStats()
+	procStats := s.processor.GetStatsSnapshot()
 	storStats := s.storage.GetStats()
 
 	duration := time.Since(s.state.StartTime)
