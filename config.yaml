@@ -1,0 +1,55 @@
+# WordPress REST API Scanner - 高性能配置
+# 优化目标: 20倍速度提升，最小化磁盘 I/O
+
+crawl:
+  name: "CC-MAIN-2025-38"  # 修改为你的批次
+  segments: []              # 空 = 处理所有段
+  start_from: 0             # 从第几个 WAT 文件开始
+
+# 🚀 并发优化: 从 1 提升到 20
+concurrency:
+  workers: 20               # ⭐ 核心优化: 20 倍并发
+  download_queue: 100       # 增大下载队列
+  process_queue: 200        # 增大处理队列
+
+# 🌐 网络优化
+network:
+  timeout: 90s              # 增加超时（应对慢速连接）
+  retry_attempts: 5         # 增加重试次数
+  retry_delay: 3s           # 重试延迟
+  max_concurrent_conns: 10  # ⭐ 最大并发HTTP连接数（避免网络错误）
+
+# 🔍 检测设置
+detection:
+  patterns:
+    - "api.w.org"
+    - "wp/v2"
+    - "wp-json"
+  enable_cdx: false         # CDX 验证（可选）
+  pre_filter: true          # 启用预过滤（加速）
+
+# 💾 输出优化: 减少磁盘同步
+output:
+  directory: "."
+  file_prefix: "hits"
+  compress: true            # 启用 gzip 压缩
+  buffer_size: 4194304      # 4MB (从 1MB 提升)
+  flush_interval: 60s       # ⭐ 60秒刷新（从 10s 延长）
+
+# 🔄 断点续扫
+resume:
+  enable: true
+  state_file: "scanner_state.json"
+  save_interval: 60s        # 60秒保存状态
+
+# 📊 日志设置
+logging:
+  log_level: "info"
+  log_file: "scanner.log"
+  progress_bar: true
+
+# ⚙️ 性能设置
+performance:
+  max_memory_mb: 10240      # 10GB (20 workers * 100MB + 余量)
+  enable_profile: false     # pprof 性能分析
+  profile_port: 6060

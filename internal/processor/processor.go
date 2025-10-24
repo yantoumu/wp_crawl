@@ -55,6 +55,28 @@ func NewWATProcessor(cfg *config.Config, det *detector.Detector, logger *zap.Log
 	retryClient.HTTPClient.Timeout = cfg.Network.Timeout
 	retryClient.Logger = nil // 使用自定义logger
 
+	// ⚡ 性能优化: 配置HTTP连接池
+	// 区分: workers数量 vs 实际HTTP并发连接数
+	// - workers: 处理goroutine数量（可以很多）
+	// - MaxConcurrentConns: 实际HTTP连接数（需要控制，避免网络错误）
+	transport := retryClient.HTTPClient.Transport.(*http.Transport)
+
+	maxConns := cfg.Network.MaxConcurrentConns
+	if maxConns <= 0 {
+		maxConns = 10 // 保守默认值
+	}
+
+	transport.MaxIdleConns = maxConns * 2                // 总空闲连接数
+	transport.MaxIdleConnsPerHost = maxConns             // 每个host的空闲连接数
+	transport.MaxConnsPerHost = maxConns                 // 每个host的最大连接数
+	transport.IdleConnTimeout = 90 * time.Second         // 空闲连接超时
+	transport.DisableKeepAlives = false                  // 启用keep-alive复用连接
+
+	logger.Info("HTTP connection pool configured",
+		zap.Int("workers", cfg.Concurrency.Workers),
+		zap.Int("max_concurrent_http_conns", maxConns),
+		zap.String("note", "workers > connections → connection reuse"))
+
 	stats := &ProcessorStats{
 		StartTime: time.Now(),
 	}
@@ -178,8 +200,8 @@ func (p *WATProcessor) streamProcessWAT(ctx context.Context, watURL string, hitC
 		// 更新处理字节数
 		p.addBytesProcessed(int64(len(content)))
 
-		// 检测WordPress API
-		hit, err := p.detector.DetectInWATRecord(content)
+		// 检测WordPress API（使用手动解析零JSON版本）
+		hit, err := p.detector.DetectInWATRecordManual(content)
 		if err != nil {
 			p.logger.Debug("Failed to detect in record",
 				zap.Error(err))
@@ -414,8 +436,8 @@ func (s *StreamProcessor) ProcessStream(ctx context.Context, reader io.Reader) (
 				continue
 			}
 
-			// 检测记录
-			hit, err := s.processor.detector.DetectInWATRecord(line)
+			// 检测记录（使用手动解析零JSON版本）
+			hit, err := s.processor.detector.DetectInWATRecordManual(line)
 			if err != nil {
 				s.logger.Debug("Failed to detect in line", zap.Error(err))
 				continue

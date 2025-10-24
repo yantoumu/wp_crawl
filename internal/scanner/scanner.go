@@ -21,6 +21,7 @@ import (
 	"github.com/yanyun/wp_crawl/internal/config"
 	"github.com/yanyun/wp_crawl/internal/detector"
 	"github.com/yanyun/wp_crawl/internal/domain"
+	"github.com/yanyun/wp_crawl/internal/monitor"
 	"github.com/yanyun/wp_crawl/internal/processor"
 	"github.com/yanyun/wp_crawl/internal/storage"
 )
@@ -33,6 +34,9 @@ type Scanner struct {
 	storage       storage.Storage
 	domainStorage *domain.Storage  // 域名存储
 	logger        *zap.Logger
+
+	// ⚡ 内存监控
+	memMonitor    *monitor.MemoryMonitor
 
 	// 状态管理
 	state     *ScannerState
@@ -86,6 +90,9 @@ func NewScanner(cfg *config.Config, logger *zap.Logger) (*Scanner, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// ⚡ 创建内存监控器
+	memMonitor := monitor.NewMemoryMonitor(cfg.Performance.MaxMemoryMB, logger)
+
 	scanner := &Scanner{
 		config:        cfg,
 		detector:      det,
@@ -93,6 +100,7 @@ func NewScanner(cfg *config.Config, logger *zap.Logger) (*Scanner, error) {
 		storage:       stor,
 		domainStorage: domainStor,
 		logger:        logger,
+		memMonitor:    memMonitor,
 		ctx:           ctx,
 		cancel:        cancel,
 		state: &ScannerState{
@@ -116,6 +124,10 @@ func (s *Scanner) Start() error {
 	s.logger.Info("Starting scanner",
 		zap.String("crawl", s.config.Crawl.Name),
 		zap.Int("workers", s.config.Concurrency.Workers))
+
+	// ⚡ 启动内存监控
+	s.memMonitor.Start()
+	defer s.memMonitor.Stop()
 
 	// 获取WAT文件列表
 	watURLs, err := s.getWATList()
@@ -372,6 +384,10 @@ func (s *Scanner) getWATList() ([]string, error) {
 
 // isSegmentCompleted 检查段是否已完成
 func (s *Scanner) isSegmentCompleted(path string) bool {
+	// ⚡ 性能优化: 使用内存状态检查，而非磁盘文件检查
+	// 旧逻辑: 检查 domains/raw/ 目录下是否存在标记文件
+	// 新逻辑: 使用 domain.Storage 的内存状态
+
 	// 方法1: 检查状态文件中的记录
 	s.stateMu.RLock()
 	for _, completed := range s.state.CompletedSegments {
@@ -382,25 +398,14 @@ func (s *Scanner) isSegmentCompleted(path string) bool {
 	}
 	s.stateMu.RUnlock()
 
-	// 方法2: 检查是否已存在对应的输出文件（更可靠）
-	// 从路径提取文件名：segments/xxx/wat/CC-MAIN-xxx.warc.wat.gz -> CC-MAIN-xxx.txt
-	parts := strings.Split(path, "/")
-	if len(parts) == 0 {
-		return false
-	}
+	// 方法2: 检查域名存储的内存状态（更高效）
+	// 构建完整的 WAT URL 用于检查
+	baseURL := "https://data.commoncrawl.org/"
+	fullURL := baseURL + path
 
-	filename := parts[len(parts)-1]
-	// 移除 .warc.wat.gz 后缀
-	filename = strings.TrimSuffix(filename, ".warc.wat.gz")
-	filename = filename + ".txt"
-
-	// 检查 domains/raw/ 目录下是否存在该文件
-	outputFile := fmt.Sprintf("domains/raw/%s", filename)
-	if _, err := os.Stat(outputFile); err == nil {
-		// 文件存在，说明已处理
+	if s.domainStorage.IsWATProcessed(fullURL) {
 		s.logger.Debug("Skipping already processed WAT file",
-			zap.String("path", path),
-			zap.String("output_file", outputFile))
+			zap.String("path", path))
 		return true
 	}
 

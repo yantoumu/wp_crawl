@@ -23,10 +23,11 @@ type Config struct {
 
 	// 网络设置
 	Network struct {
-		Timeout       time.Duration `mapstructure:"timeout"`        // HTTP超时时间
-		RetryAttempts int           `mapstructure:"retry_attempts"` // 重试次数
-		RetryDelay    time.Duration `mapstructure:"retry_delay"`    // 重试延迟
-		UserAgent     string        `mapstructure:"user_agent"`     // User-Agent
+		Timeout              time.Duration `mapstructure:"timeout"`                 // HTTP超时时间
+		RetryAttempts        int           `mapstructure:"retry_attempts"`          // 重试次数
+		RetryDelay           time.Duration `mapstructure:"retry_delay"`             // 重试延迟
+		UserAgent            string        `mapstructure:"user_agent"`              // User-Agent
+		MaxConcurrentConns   int           `mapstructure:"max_concurrent_conns"`    // 最大并发HTTP连接数
 	} `mapstructure:"network"`
 
 	// 检测设置
@@ -90,15 +91,17 @@ func DefaultConfig() *Config {
 			ProcessQueue:  100,
 		},
 		Network: struct {
-			Timeout       time.Duration `mapstructure:"timeout"`
-			RetryAttempts int           `mapstructure:"retry_attempts"`
-			RetryDelay    time.Duration `mapstructure:"retry_delay"`
-			UserAgent     string        `mapstructure:"user_agent"`
+			Timeout              time.Duration `mapstructure:"timeout"`
+			RetryAttempts        int           `mapstructure:"retry_attempts"`
+			RetryDelay           time.Duration `mapstructure:"retry_delay"`
+			UserAgent            string        `mapstructure:"user_agent"`
+			MaxConcurrentConns   int           `mapstructure:"max_concurrent_conns"`
 		}{
-			Timeout:       30 * time.Second,
-			RetryAttempts: 3,
-			RetryDelay:    2 * time.Second,
-			UserAgent:     "WP-Scanner/1.0 (WordPress API Discovery)",
+			Timeout:            30 * time.Second,
+			RetryAttempts:      3,
+			RetryDelay:         2 * time.Second,
+			UserAgent:          "WP-Scanner/1.0 (WordPress API Discovery)",
+			MaxConcurrentConns: 10,  // 默认10个并发连接（保守值，避免网络错误）
 		},
 		Detection: struct {
 			Patterns      []string      `mapstructure:"patterns"`

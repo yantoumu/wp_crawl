@@ -25,6 +25,16 @@ var blacklistKeywords = []string{
 	"casin0", "g4mble", "b3t",
 }
 
+// 中文语言代码列表 - 所有变体
+var chineseLanguageCodes = []string{
+	"zh", "zh_CH", "zh_cn", "zh_CN", "zh_hk", "zh_HK", "zh_tw", "zh_TW",
+	"zh-cn", "zh-CN", "zh-hk", "zh-HK", "zh-tw", "zh-TW", "zh-sg", "zh-SG",
+	"zh-cmn", "zh-cmn-Hans", "zh-cmn-Hant",
+	"zh-hans", "zh-Hans", "zh-Hans-CN",
+	"zh-hant", "zh-Hant", "zh-Hant-TW", "zh-Hant-HK",
+	"cmn", "cmn-Hans", "cmn-Hant",
+}
+
 // IPv4地址正则表达式
 var ipv4Regex = regexp.MustCompile(`^(\d{1,3}\.){3}\d{1,3}$`)
 
@@ -73,6 +83,27 @@ func containsBlacklistedKeywords(domain string) bool {
 	}
 
 	return false
+}
+
+// isChineseLanguageCode 检测是否为中文语言代码
+func isChineseLanguageCode(languageCode string) bool {
+	if languageCode == "" {
+		return false
+	}
+
+	// 精确匹配
+	for _, code := range chineseLanguageCodes {
+		if languageCode == code {
+			return true
+		}
+	}
+
+	// 前缀匹配 (例如 "zh-*" 的任何变体)
+	languageLower := strings.ToLower(languageCode)
+	return strings.HasPrefix(languageLower, "zh-") ||
+		strings.HasPrefix(languageLower, "zh_") ||
+		strings.HasPrefix(languageLower, "cmn-") ||
+		strings.HasPrefix(languageLower, "cmn_")
 }
 
 // isValidDomain 验证域名是否有效（非IP、非黑名单）
@@ -163,6 +194,25 @@ func (e *Extractor) AddFromURLWithLanguage(rawURL, language string) error {
 	// 验证域名（过滤IP地址和黑名单关键词）
 	if !isValidDomain(domain) {
 		return nil // 跳过无效域名，不报错
+	}
+
+	// 过滤中文语言代码
+	if isChineseLanguageCode(language) {
+		return nil // 跳过中文语言的域名，不报错
+	}
+
+	// 过滤 .cn 域名
+	parsedURL, err := url.Parse(domain)
+	if err == nil && parsedURL.Host != "" {
+		host := parsedURL.Host
+		// 移除端口号
+		if idx := strings.Index(host, ":"); idx != -1 {
+			host = host[:idx]
+		}
+		// 检查是否以 .cn 结尾
+		if strings.HasSuffix(strings.ToLower(host), ".cn") {
+			return nil // 跳过 .cn 域名，不报错
+		}
 	}
 
 	e.AddWithLanguage(domain, language)

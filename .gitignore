@@ -51,3 +51,5 @@ scan.pid
 *.tmp
 temp/
 tmp/
+wp_crawl_fast
+scanner_*.log

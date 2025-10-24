@@ -2,24 +2,36 @@ package domain
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 )
 
 // Storage 域名存储管理器
 type Storage struct {
-	outputDir     string            // 输出目录
-	rawDir        string            // 原始域名目录（每个文件一个）
-	masterFile    string            // 主域名文件（全局去重）
-	logger        *zap.Logger       // 日志记录器
-	globalDomains map[string]string // 全局域名->语言映射（用于去重）
-	mu            sync.RWMutex      // 保护全局域名集合
+	outputDir       string            // 输出目录
+	rawDir          string            // 原始域名目录（已废弃，保留用于兼容性）
+	masterFile      string            // 主域名文件（全局去重）
+	stateFile       string            // 断点续传状态文件
+	logger          *zap.Logger       // 日志记录器
+
+	// ⚡ 性能优化: 使用分片 map 减少锁竞争
+	globalDomains   *ShardedMap       // 全局域名->语言映射（分片存储）
+
+	// 断点续传状态
+	processedWATs   map[string]bool   // 内存记录已处理的 WAT 文件
+	processedMu     sync.RWMutex      // 保护已处理列表
+
+	// 内存管理
+	lastSaveTime    time.Time         // 上次保存时间
+	saveCounter     int               // 保存计数器（用于定期持久化）
 }
 
 // NewStorage 创建新的域名存储管理器
@@ -31,13 +43,18 @@ func NewStorage(outputDir string, logger *zap.Logger) (*Storage, error) {
 	}
 
 	masterFile := filepath.Join(outputDir, "domains.txt")
+	stateFile := filepath.Join(outputDir, "processed_wats.state")
 
 	s := &Storage{
 		outputDir:     outputDir,
 		rawDir:        rawDir,
 		masterFile:    masterFile,
+		stateFile:     stateFile,
 		logger:        logger,
-		globalDomains: make(map[string]string),
+		globalDomains: NewShardedMap(32), // ⚡ 32 个分片，减少锁竞争
+		processedWATs: make(map[string]bool),
+		lastSaveTime:  time.Now(),
+		saveCounter:   0,
 	}
 
 	// 加载已有的主域名文件（如果存在）
@@ -45,67 +62,73 @@ func NewStorage(outputDir string, logger *zap.Logger) (*Storage, error) {
 		logger.Warn("Failed to load existing master file", zap.Error(err))
 	}
 
+	// ⚡ 加载断点续传状态
+	if err := s.loadProcessedState(); err != nil {
+		logger.Warn("Failed to load processed state", zap.Error(err))
+	}
+
 	return s, nil
 }
 
 // SaveBatch 保存一个批次的域名（处理完一个 WAT 文件）
-// fileName: WAT 文件名（用于命名输出文件）
+// fileName: WAT 文件名（用于记录已处理状态）
 // domainLangPairs: 该文件提取的域名-语言对列表（格式：domain,language）
 func (s *Storage) SaveBatch(fileName string, domainLangPairs []string) error {
-	// 更新全局域名集合（即使没有域名也要更新）
-	s.updateGlobal(domainLangPairs)
+	// ⚡ 性能优化: 使用分片 map，无需全局锁
 
-	// 生成标记文件名（基于 WAT 文件名）
-	baseName := filepath.Base(fileName)
-	baseName = strings.TrimSuffix(baseName, ".warc.wat.gz")
-	baseName = strings.TrimSuffix(baseName, ".warc.gz")
-	markerFile := filepath.Join(s.rawDir, baseName+".txt")
-
-	// 创建空标记文件（用于断点续传检测）
-	// 不写入实际数据，所有数据在主文件 domains.txt 中
-	file, err := os.Create(markerFile)
-	if err != nil {
-		return fmt.Errorf("failed to create marker file: %w", err)
-	}
-	file.Close()
-
-	return nil
-}
-
-// updateGlobal 更新全局域名集合
-func (s *Storage) updateGlobal(domainLangPairs []string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	// 更新全局域名集合（分片存储，自动分散锁竞争）
 	for _, pair := range domainLangPairs {
-		// 解析 domain,language,hasForm 格式（兼容旧格式 domain,language）
 		parts := strings.SplitN(pair, ",", 3)
 		if len(parts) >= 2 {
 			domain := parts[0]
 			language := parts[1]
 
-			// 如果域名不存在，或者新的语言不为空而旧的为空，则更新
-			if existingLang, exists := s.globalDomains[domain]; !exists || (language != "" && existingLang == "") {
-				s.globalDomains[domain] = language
+			// 检查是否需要更新
+			if existingLang, exists := s.globalDomains.Get(domain); !exists || (language != "" && existingLang == "") {
+				s.globalDomains.Set(domain, language)
 			}
 		}
 	}
+
+	// 记录已处理的 WAT 文件（用于断点续传）
+	s.processedMu.Lock()
+	s.processedWATs[fileName] = true
+	s.saveCounter++
+	needSave := s.saveCounter%100 == 0 // 每处理 100 个文件持久化一次
+	s.processedMu.Unlock()
+
+	// ⚡ 定期持久化断点续传状态（减少磁盘 I/O）
+	if needSave {
+		if err := s.saveProcessedState(); err != nil {
+			s.logger.Warn("Failed to save processed state", zap.Error(err))
+		}
+	}
+
+	return nil
+}
+
+// IsWATProcessed 检查 WAT 文件是否已处理（用于断点续传）
+func (s *Storage) IsWATProcessed(fileName string) bool {
+	s.processedMu.RLock()
+	defer s.processedMu.RUnlock()
+	return s.processedWATs[fileName]
 }
 
 // SaveMaster 保存主域名文件（全局去重后的所有域名）
 func (s *Storage) SaveMaster() error {
-	s.mu.RLock()
-	domainLangPairs := make([]string, 0, len(s.globalDomains))
-	for domain, language := range s.globalDomains {
-		// 格式: domain,language (判断规则不变，只是保存格式简化)
-		pair := domain + "," + language
-		domainLangPairs = append(domainLangPairs, pair)
-	}
-	s.mu.RUnlock()
+	// ⚡ 使用分片 map 并发获取所有域名
+	allDomains := s.globalDomains.GetAll()
 
-	if len(domainLangPairs) == 0 {
+	if len(allDomains) == 0 {
 		s.logger.Warn("No domains to save to master file")
 		return nil
+	}
+
+	// 构建域名-语言对列表
+	domainLangPairs := make([]string, 0, len(allDomains))
+	for domain, language := range allDomains {
+		pair := domain + "," + language
+		domainLangPairs = append(domainLangPairs, pair)
 	}
 
 	// 排序
@@ -133,6 +156,11 @@ func (s *Storage) SaveMaster() error {
 		zap.String("file", s.masterFile),
 		zap.Int("total_unique", len(domainLangPairs)))
 
+	// ⚡ 同时保存断点续传状态
+	if err := s.saveProcessedState(); err != nil {
+		s.logger.Warn("Failed to save processed state", zap.Error(err))
+	}
+
 	return nil
 }
 
@@ -147,9 +175,6 @@ func (s *Storage) loadMasterFile() error {
 	}
 	defer file.Close()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	scanner := bufio.NewScanner(file)
 	count := 0
 	for scanner.Scan() {
@@ -160,10 +185,10 @@ func (s *Storage) loadMasterFile() error {
 			if len(parts) == 2 {
 				domain := parts[0]
 				language := parts[1]
-				s.globalDomains[domain] = language
+				s.globalDomains.Set(domain, language) // 使用分片map
 			} else {
 				// 兼容旧格式（只有域名）
-				s.globalDomains[line] = ""
+				s.globalDomains.Set(line, "")
 			}
 			count++
 		}
@@ -180,12 +205,69 @@ func (s *Storage) loadMasterFile() error {
 	return nil
 }
 
+// saveProcessedState 保存断点续传状态到磁盘
+func (s *Storage) saveProcessedState() error {
+	s.processedMu.RLock()
+	processedList := make([]string, 0, len(s.processedWATs))
+	for fileName := range s.processedWATs {
+		processedList = append(processedList, fileName)
+	}
+	s.processedMu.RUnlock()
+
+	// 序列化为 JSON
+	data, err := json.MarshalIndent(processedList, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal processed state: %w", err)
+	}
+
+	// 原子写入（先写临时文件，再重命名）
+	tmpFile := s.stateFile + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		return fmt.Errorf("failed to write state file: %w", err)
+	}
+
+	if err := os.Rename(tmpFile, s.stateFile); err != nil {
+		return fmt.Errorf("failed to rename state file: %w", err)
+	}
+
+	s.logger.Debug("Processed state saved",
+		zap.String("file", s.stateFile),
+		zap.Int("count", len(processedList)))
+
+	return nil
+}
+
+// loadProcessedState 从磁盘加载断点续传状态
+func (s *Storage) loadProcessedState() error {
+	data, err := os.ReadFile(s.stateFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // 文件不存在，不是错误
+		}
+		return fmt.Errorf("failed to read state file: %w", err)
+	}
+
+	var processedList []string
+	if err := json.Unmarshal(data, &processedList); err != nil {
+		return fmt.Errorf("failed to unmarshal state: %w", err)
+	}
+
+	s.processedMu.Lock()
+	for _, fileName := range processedList {
+		s.processedWATs[fileName] = true
+	}
+	s.processedMu.Unlock()
+
+	s.logger.Info("Loaded processed state",
+		zap.String("file", s.stateFile),
+		zap.Int("count", len(processedList)))
+
+	return nil
+}
+
 // GetGlobalCount 获取全局唯一域名数量
 func (s *Storage) GetGlobalCount() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	return len(s.globalDomains)
+	return s.globalDomains.Count()
 }
 
 // Close 关闭存储（保存最终的主文件）
