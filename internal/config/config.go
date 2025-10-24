@@ -67,6 +67,15 @@ type Config struct {
 		EnableProfile bool `mapstructure:"enable_profile"`  // 是否启用性能分析
 		ProfilePort   int  `mapstructure:"profile_port"`    // 性能分析端口
 	} `mapstructure:"performance"`
+
+	// 外部API导出
+	Exporter struct {
+		Enable    bool          `mapstructure:"enable"`     // 是否启用外部API导出
+		APIURL    string        `mapstructure:"api_url"`    // API端点URL
+		APIKey    string        `mapstructure:"api_key"`    // API密钥
+		BatchSize int           `mapstructure:"batch_size"` // 批量大小
+		Timeout   time.Duration `mapstructure:"timeout"`    // 请求超时
+	} `mapstructure:"exporter"`
 }
 
 // DefaultConfig 返回默认配置
@@ -153,6 +162,19 @@ func DefaultConfig() *Config {
 			MaxMemoryMB:   2048,
 			EnableProfile: false,
 			ProfilePort:   6060,
+		},
+		Exporter: struct {
+			Enable    bool          `mapstructure:"enable"`
+			APIURL    string        `mapstructure:"api_url"`
+			APIKey    string        `mapstructure:"api_key"`
+			BatchSize int           `mapstructure:"batch_size"`
+			Timeout   time.Duration `mapstructure:"timeout"`
+		}{
+			Enable:    false,
+			APIURL:    "http://w.seo9.org:5001/api/external-links/pending/batch-import",
+			APIKey:    "test_key_123",
+			BatchSize: 500,
+			Timeout:   30 * time.Second,
 		},
 	}
 }

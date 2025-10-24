@@ -21,6 +21,7 @@ import (
 	"github.com/yanyun/wp_crawl/internal/config"
 	"github.com/yanyun/wp_crawl/internal/detector"
 	"github.com/yanyun/wp_crawl/internal/domain"
+	"github.com/yanyun/wp_crawl/internal/exporter"
 	"github.com/yanyun/wp_crawl/internal/monitor"
 	"github.com/yanyun/wp_crawl/internal/processor"
 	"github.com/yanyun/wp_crawl/internal/storage"
@@ -33,6 +34,7 @@ type Scanner struct {
 	processor     *processor.WATProcessor
 	storage       storage.Storage
 	domainStorage *domain.Storage  // 域名存储
+	apiExporter   *exporter.APIExporter // API导出器
 	logger        *zap.Logger
 
 	// ⚡ 内存监控
@@ -93,12 +95,27 @@ func NewScanner(cfg *config.Config, logger *zap.Logger) (*Scanner, error) {
 	// ⚡ 创建内存监控器
 	memMonitor := monitor.NewMemoryMonitor(cfg.Performance.MaxMemoryMB, logger)
 
+	// ⚡ 创建API导出器（如果启用）
+	var apiExp *exporter.APIExporter
+	if cfg.Exporter.Enable {
+		apiExp = exporter.NewAPIExporter(exporter.Config{
+			APIURL:    cfg.Exporter.APIURL,
+			APIKey:    cfg.Exporter.APIKey,
+			BatchSize: cfg.Exporter.BatchSize,
+			Timeout:   cfg.Exporter.Timeout,
+		}, logger)
+		logger.Info("API exporter enabled",
+			zap.String("api_url", cfg.Exporter.APIURL),
+			zap.Int("batch_size", cfg.Exporter.BatchSize))
+	}
+
 	scanner := &Scanner{
 		config:        cfg,
 		detector:      det,
 		processor:     proc,
 		storage:       stor,
 		domainStorage: domainStor,
+		apiExporter:   apiExp,
 		logger:        logger,
 		memMonitor:    memMonitor,
 		ctx:           ctx,
@@ -242,6 +259,15 @@ func (s *Scanner) Start() error {
 				zap.Error(err))
 		}
 
+		// ⚡ 导出到外部API（如果启用）
+		if s.apiExporter != nil {
+			if err := s.apiExporter.Add(hit.URL, hit.Language); err != nil {
+				s.logger.Error("Failed to export to API",
+					zap.String("url", hit.URL),
+					zap.Error(err))
+			}
+		}
+
 		// 更新进度（降低频率：100 → 1000，减少90%系统调用）
 		if s.progress != nil && atomic.LoadInt64(&totalHits)%1000 == 0 {
 			processedWATs := s.getProcessedWATCount()
@@ -267,6 +293,18 @@ func (s *Scanner) Start() error {
 	} else {
 		s.logger.Info("All domains saved",
 			zap.Int("total_unique", s.domainStorage.GetGlobalCount()))
+	}
+
+	// ⚡ 刷新API导出器缓冲区
+	if s.apiExporter != nil {
+		if err := s.apiExporter.Flush(); err != nil {
+			s.logger.Error("Failed to flush API exporter", zap.Error(err))
+		} else {
+			sent, fails := s.apiExporter.GetStats()
+			s.logger.Info("API export completed",
+				zap.Int64("total_sent", sent),
+				zap.Int64("total_fails", fails))
+		}
 	}
 
 	// 关闭写入器

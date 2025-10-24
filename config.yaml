@@ -53,3 +53,11 @@ performance:
   max_memory_mb: 10240      # 10GB (20 workers * 100MB + 余量)
   enable_profile: false     # pprof 性能分析
   profile_port: 6060
+
+# 🌐 外部API导出 (需要确认正确的端口和协议)
+exporter:
+  enable: false             # 暂时禁用（API地址需确认）
+  api_url: "http://w.seo9.org:5001/api/external-links/pending/batch-import"
+  api_key: "test_key_123"
+  batch_size: 500           # 批量大小（每500个一批）
+  timeout: 30s              # API请求超时
